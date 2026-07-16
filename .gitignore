@@ -1,0 +1,6 @@
+dist/
+node_modules/
+*.js
+!src/**/*.js
+.env
+.env.local
