@@ -1,10 +1,14 @@
 import { PublicKey } from "@solana/web3.js";
-import { BorshInstructionCoder } from "@coral-xyz/anchor";
+import { BorshInstructionCoder } from "@anchor-lang/core";
 import { SolanaService } from "../services/solana.service";
 import ninetyIdl from "../config/ninety.json";
 
 const coder = new BorshInstructionCoder(ninetyIdl as any);
 const PROGRAM_ID = new PublicKey((ninetyIdl as any).address);
+
+function toCamelCase(name: string): string {
+  return name.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
+}
 
 export interface VerifiedInstruction {
   name: string;
@@ -12,11 +16,6 @@ export interface VerifiedInstruction {
   accountKeys: string[];
 }
 
-/**
- * Fetches a finalized/confirmed transaction and decodes every instruction in it that
- * targets our program. Money-moving API routes must call this before trusting any
- * client-submitted signature — a signature string alone proves nothing.
- */
 export async function fetchProgramInstructions(
   solana: SolanaService,
   signature: string
@@ -53,7 +52,7 @@ export async function fetchProgramInstructions(
     if (!decoded) continue;
 
     results.push({
-      name: decoded.name,
+      name: toCamelCase(decoded.name),
       data: decoded.data as Record<string, any>,
       accountKeys: ix.accountKeyIndexes.map((idx) => allKeys[idx]!.toBase58()),
     });

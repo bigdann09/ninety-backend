@@ -1,5 +1,5 @@
 import axios from "axios";
-import * as anchor from "@coral-xyz/anchor";
+import * as anchor from "@anchor-lang/core";
 import { PublicKey, SystemProgram, Connection } from "@solana/web3.js";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,

@@ -2,17 +2,8 @@ import { supabaseAdmin } from "../lib/supabase";
 import { SolanaService } from "./solana.service";
 import { MarketStatus } from "./pipeline.service";
 
-/**
- * The tournament-winner market lives under a synthetic "match" row so it can reuse
- * the existing matches/markets tables, the on-chain market program, and the whole
- * stake/receipt flow — no schema changes. Every matches/pipeline consumer must
- * exclude this id so it never renders as a fixture or gets auto-market'd.
- */
 export const TOURNAMENT_MATCH_ID = "wc2026-winner";
-
-/** Betting closes when the final kicks off. */
 export const TOURNAMENT_CLOSES_AT = "2026-07-19T19:00:00Z";
-
 export const TOURNAMENT_TEAMS = [
   "France",
   "Brazil",
@@ -33,11 +24,6 @@ export function teamFromQuestion(question: string): string | null {
   return m ? m[1] : null;
 }
 
-/**
- * Idempotent bootstrap: creates the synthetic tournament match and one open
- * yes/no market per team (with its on-chain counterpart). Safe to run on every
- * startup — existing rows are left untouched.
- */
 export async function ensureTournamentMarkets(solanaService: SolanaService): Promise<void> {
   const { data: existingMatch } = await supabaseAdmin
     .from("matches")
@@ -66,56 +52,63 @@ export async function ensureTournamentMarkets(solanaService: SolanaService): Pro
 
   const { data: existingMarkets } = await supabaseAdmin
     .from("markets")
-    .select("id, question")
+    .select("id, question, status, opens_at, closes_at")
     .eq("match_id", TOURNAMENT_MATCH_ID);
 
-  const existingQuestions = new Set((existingMarkets || []).map((m) => m.question));
+  const existingByQuestion = new Map((existingMarkets || []).map((m) => [m.question, m]));
 
   for (const team of TOURNAMENT_TEAMS) {
     const question = tournamentQuestion(team);
-    if (existingQuestions.has(question)) continue;
+    const existing = existingByQuestion.get(question);
 
-    const { data: inserted, error: mErr } = await supabaseAdmin
-      .from("markets")
-      .insert({
-        match_id: TOURNAMENT_MATCH_ID,
-        market_type: "fulltime",
-        question,
-        opens_at: new Date(Date.now() - 30_000).toISOString(),
-        closes_at: TOURNAMENT_CLOSES_AT,
-        status: MarketStatus.OPEN,
-      })
-      .select("*")
-      .single();
+    // A row already exists and its on-chain market was confirmed created — nothing to do.
+    if (existing && existing.status !== MarketStatus.VOID) continue;
 
-    if (mErr || !inserted) {
-      console.error(`[Tournament] Failed to create market for ${team}:`, mErr?.message);
-      continue;
+    let marketRow = existing;
+    if (!marketRow) {
+      const { data: inserted, error: mErr } = await supabaseAdmin
+        .from("markets")
+        .insert({
+          match_id: TOURNAMENT_MATCH_ID,
+          market_type: "fulltime",
+          question,
+          opens_at: new Date(Date.now() - 30_000).toISOString(),
+          closes_at: TOURNAMENT_CLOSES_AT,
+          status: MarketStatus.VOID,
+        })
+        .select("*")
+        .single();
+
+      if (mErr || !inserted) {
+        console.error(`[Tournament] Failed to create market row for ${team}:`, mErr?.message);
+        continue;
+      }
+      marketRow = inserted;
+    } else {
+      console.log(`[Tournament] Retrying on-chain market creation for ${team} (previously void)`);
     }
+    if (!marketRow) continue;
 
     try {
       await new Promise((r) => setTimeout(r, 1500));
       const txSig = await solanaService.createMarket(
         TOURNAMENT_MATCH_ID,
-        inserted.id,
-        new Date(inserted.opens_at),
-        new Date(inserted.closes_at)
+        marketRow.id,
+        new Date(marketRow.opens_at),
+        new Date(marketRow.closes_at)
       );
+      const onChainPubkey = solanaService.getMarketPda(TOURNAMENT_MATCH_ID, marketRow.id).toBase58();
+      await supabaseAdmin
+        .from("markets")
+        .update({ status: MarketStatus.OPEN, on_chain_pubkey: onChainPubkey })
+        .eq("id", marketRow.id);
       console.log(`[Tournament] Created on-chain winner market for ${team}: ${txSig}`);
     } catch (e: any) {
-      console.error(`[Tournament] On-chain market creation failed for ${team}, proceeding:`, e.message);
+      console.error(`[Tournament] On-chain market creation failed for ${team}, will retry next run:`, e.message);
     }
-
-    const onChainPubkey = solanaService.getMarketPda(TOURNAMENT_MATCH_ID, inserted.id).toBase58();
-    await supabaseAdmin.from("markets").update({ on_chain_pubkey: onChainPubkey }).eq("id", inserted.id);
   }
 }
 
-/**
- * Settles every tournament market at once: the winner's market as YES, all others
- * as NO. On-chain anchoring/settlement is best-effort per market (same posture as
- * the pipeline's expiry settlement); the DB outcome is always written.
- */
 export async function settleTournament(
   solanaService: SolanaService,
   computeEventHash: (payload: any) => string,
