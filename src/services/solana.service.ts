@@ -126,7 +126,15 @@ export class SolanaService {
     }
   }
 
-  /** Invokes the create_market instruction on Solana (keeper-signed). */
+  /**
+   * Invokes the create_market instruction on Solana (keeper-signed). market_id/match_id
+   * seeds are caller-chosen and often deterministic (e.g. a P2P challenge id), so a caller
+   * can legitimately retry this after a failure elsewhere in its own flow (e.g. the DB
+   * write that's supposed to follow this call). Anchor's `init` constraint means a second
+   * real attempt would fail with "already in use" — since that failure mode is
+   * indistinguishable from success (the market this call would have created already
+   * exists with the right seeds), treat it as success instead of erroring the caller.
+   */
   public async createMarket(
     matchId: string,
     marketId: string,
@@ -135,22 +143,35 @@ export class SolanaService {
   ): Promise<string> {
     const marketPda = this.getMarketPda(matchId, marketId);
     const vaultPda = this.getVaultPda(marketPda);
+
+    const existing = await this.connection.getAccountInfo(marketPda);
+    if (existing) {
+      return "already-exists";
+    }
+
     const opensAtBn = new BN(Math.floor(opensAt.getTime() / 1000));
     const closesAtBn = new BN(Math.floor(closesAt.getTime() / 1000));
     const matchBytes = this.toBytes32(matchId);
     const marketBytes = this.toBytes32(marketId);
 
-    return this.withRpcRetry(() =>
-      this.program.methods
-        .createMarket(matchBytes, marketBytes, opensAtBn, closesAtBn)
-        .accounts({
-          authority: this.keeperKeypair.publicKey,
-          market: marketPda,
-          vault: vaultPda,
-          systemProgram: SystemProgram.programId,
-        })
-        .rpc()
-    );
+    try {
+      return await this.withRpcRetry(() =>
+        this.program.methods
+          .createMarket(matchBytes, marketBytes, opensAtBn, closesAtBn)
+          .accounts({
+            authority: this.keeperKeypair.publicKey,
+            market: marketPda,
+            vault: vaultPda,
+            systemProgram: SystemProgram.programId,
+          })
+          .rpc()
+      );
+    } catch (err: any) {
+      // Lost the race against a concurrent/earlier attempt that already created it.
+      const alreadyInUse = err?.message?.includes("already in use") || err?.logs?.some((l: string) => l.includes("already in use"));
+      if (alreadyInUse) return "already-exists";
+      throw err;
+    }
   }
 
   /** Invokes the anchor_event instruction on Solana (keeper-signed). */

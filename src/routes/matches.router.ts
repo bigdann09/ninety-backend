@@ -3,6 +3,8 @@ import { supabaseAdmin } from "../lib/supabase";
 import { GroqService } from "../services/groq.service";
 import { getTxlineService } from "../services/instances";
 import { TOURNAMENT_MATCH_ID } from "../services/tournament.service";
+import { cachedGroqCall } from "../lib/groq-cache";
+import { computeTeamStats, computeMomentum, computeTimeline, computeWinProbability } from "../services/match-pulse.service";
 
 const router = Router();
 
@@ -331,16 +333,25 @@ router.get("/:id/copilot", async (req, res) => {
 
     const diffMs = Date.now() - new Date(match.kickoff_at).getTime();
     const minute = Math.max(1, Math.min(90, Math.floor(diffMs / 60000)));
+    // Finished matches never change — cache their copilot read forever. Live ones get a
+    // short TTL so the "live commentary" feel survives while still absorbing the
+    // frontend's 6s poll (each poll no longer means a fresh Groq call).
+    const isFinished = match.status === "full_time";
 
     try {
-      const copilotInfo = await GroqService.generateCopilotInfo(
-        match.home_team,
-        match.away_team,
-        match.score_home ?? 0,
-        match.score_away ?? 0,
-        minute,
-        events || [],
-        match.competition
+      const copilotInfo = await cachedGroqCall(
+        `copilot:${id}`,
+        isFinished ? null : 20_000,
+        () =>
+          GroqService.generateCopilotInfo(
+            match.home_team,
+            match.away_team,
+            match.score_home ?? 0,
+            match.score_away ?? 0,
+            minute,
+            events || [],
+            match.competition
+          )
       );
 
       res.json({ ...copilotInfo, updatedAt: Date.now() });
@@ -348,6 +359,94 @@ router.get("/:id/copilot", async (req, res) => {
       console.warn("Groq copilot generation failed, using mock copilot fallback:", e.message);
       res.status(500).json({ error: e.message || "Groq copilot error" });
     }
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Internal server error" });
+  }
+});
+
+// GET /matches/:id/pulse
+router.get("/:id/pulse", async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { data: match, error: matchError } = await supabaseAdmin
+      .from("matches")
+      .select("*")
+      .eq("id", id)
+      .maybeSingle();
+
+    if (matchError || !match) {
+      res.status(404).json({ error: matchError?.message || "Match not found" });
+      return;
+    }
+
+    const { data: events, error: eventsError } = await supabaseAdmin
+      .from("match_events")
+      .select("*")
+      .eq("match_id", id)
+      .order("occurred_at", { ascending: true });
+
+    if (eventsError) {
+      res.status(500).json({ error: eventsError.message || "Database error" });
+      return;
+    }
+
+    const allEvents = events || [];
+    const kickoffMs = new Date(match.kickoff_at).getTime();
+    const diffMs = Date.now() - kickoffMs;
+    const minute = Math.max(1, Math.min(90, Math.floor(diffMs / 60000)));
+    const isFinished = match.status === "full_time";
+
+    const stats = computeTeamStats(allEvents);
+    const { points: momentum, current: momentumCurrent } = computeMomentum(allEvents, kickoffMs, isFinished ? 90 : minute);
+    const timeline = computeTimeline(allEvents, kickoffMs);
+    const winProbability = computeWinProbability(
+      match.status,
+      match.score_home ?? 0,
+      match.score_away ?? 0,
+      minute,
+      momentumCurrent
+    );
+
+    const keyEventsForPrompt = timeline
+      .filter((t) => t.type === "goal" || t.type === "red_card" || t.type === "redcard")
+      .map((t) => ({ type: t.type, minute: t.minute, team: t.team }));
+
+    let narrative: { summary: string; keyMoments: string[] };
+    try {
+      narrative = await cachedGroqCall(
+        `pulse:${id}`,
+        isFinished ? null : 30_000,
+        () =>
+          GroqService.generateMatchPulseNarrative(
+            match.home_team,
+            match.away_team,
+            match.score_home ?? 0,
+            match.score_away ?? 0,
+            match.status,
+            minute,
+            keyEventsForPrompt,
+            match.competition
+          )
+      );
+    } catch (e: any) {
+      console.warn("Match Pulse narrative unavailable, omitting:", e.message);
+      narrative = { summary: "", keyMoments: [] };
+    }
+
+    res.json({
+      status: match.status,
+      minute,
+      score: { home: match.score_home ?? 0, away: match.score_away ?? 0 },
+      teams: { home: match.home_team, away: match.away_team },
+      stats,
+      momentum,
+      momentumCurrent,
+      winProbability,
+      timeline,
+      summary: narrative.summary,
+      keyMoments: narrative.keyMoments,
+      updatedAt: Date.now(),
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Internal server error" });
   }

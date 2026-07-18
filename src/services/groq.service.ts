@@ -6,7 +6,6 @@ export function ordinal(n: number): string {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
-/** Thrown when neither the AI nor the event-based heuristic can confidently resolve a P2P challenge — never guess on real money. */
 export class AIUndeterminedError extends Error {}
 
 export class GroqService {
@@ -150,6 +149,48 @@ Recent events (last 5): ${JSON.stringify(sortedEvents.slice(0, 5).map(ev => ({ t
     }
   }
 
+  public static async generateMatchPulseNarrative(
+    homeTeam: string,
+    awayTeam: string,
+    scoreHome: number,
+    scoreAway: number,
+    status: string,
+    minute: number,
+    keyEvents: { type: string; minute: number; team: string | null }[],
+    competition: string = "Unknown"
+  ): Promise<{ summary: string; keyMoments: string[] }> {
+    const isFinished = status === "full_time";
+
+    const systemPrompt = `You are a football analyst writing a short "match pulse" summary for Ninety, a Solana prediction market.
+Generate a valid JSON object with exactly these keys:
+1. "summary": ONE short paragraph (max 40 words) describing the current match state. Be specific — mention the score and what's happening, not generic filler.
+2. "keyMoments": an array of up to 3 short strings (max 20 words each), each describing one turning point from the key events provided, in chronological order. If there are fewer than 3 real turning points, return fewer items — never pad with invented ones.
+Output ONLY the raw JSON. No preamble.`;
+
+    const userPrompt = `Match: ${homeTeam} vs ${awayTeam}
+Competition: ${competition}
+Status: ${status}${isFinished ? " (finished)" : ` (${ordinal(minute)} minute)`}
+Score: ${scoreHome}-${scoreAway}
+Key events in order: ${JSON.stringify(keyEvents)}`;
+
+    try {
+      return await this.getChatCompletion(systemPrompt, userPrompt, true);
+    } catch (err) {
+      console.warn("Falling back to local simulation for Match Pulse narrative.");
+      const scoreLine = `${homeTeam} ${scoreHome}-${scoreAway} ${awayTeam}`;
+      const summary = isFinished
+        ? `${scoreLine} — full time. ${scoreHome === scoreAway ? "A drawn match." : `${scoreHome > scoreAway ? homeTeam : awayTeam} came out on top.`}`
+        : `${scoreLine} at the ${ordinal(minute)} minute, ${Math.max(0, 90 - minute)} minutes left to play.`;
+
+      const keyMoments = keyEvents
+        .filter((e) => e.type === "goal" || e.type === "red_card")
+        .slice(0, 3)
+        .map((e) => `${e.type === "goal" ? "Goal" : "Red card"} at the ${ordinal(e.minute)} minute${e.team ? ` (${e.team === "home" ? homeTeam : awayTeam})` : ""}.`);
+
+      return { summary, keyMoments };
+    }
+  }
+
   public static async generateRecommendations(
     userWallet: string,
     history: any[],
@@ -242,11 +283,6 @@ Away Team: ${awayTeam}`;
     }
   }
 
-  /**
-   * Determines the outcome of a real-money P2P wager. Never guesses: if the AI call fails
-   * and the event log doesn't contain unambiguous evidence, this throws AIUndeterminedError
-   * so the caller can route the challenge to manual admin review instead of settling it.
-   */
   public static async evaluateP2pChallenge(
     question: string,
     homeTeam: string,
