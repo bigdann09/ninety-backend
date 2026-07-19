@@ -76,7 +76,10 @@ function officialTotals(events: any[], participant1IsHome: boolean): { home: Par
     : { home: toPartial(p2), away: toPartial(p1) };
 }
 
-export function computeTeamStats(events: any[]): { home: TeamStats; away: TeamStats } {
+export function computeTeamStats(
+  events: any[],
+  authoritativeScore?: { home: number; away: number }
+): { home: TeamStats; away: TeamStats } {
   const home = emptyStats();
   const away = emptyStats();
 
@@ -85,6 +88,17 @@ export function computeTeamStats(events: any[]): { home: TeamStats; away: TeamSt
   if (official) {
     Object.assign(home, official.home);
     Object.assign(away, official.away);
+  }
+
+  // The "official Score totals" above come from whichever event happened to be the last
+  // one carrying a Score payload — not necessarily the true final one, since some later
+  // events (e.g. game_finalised) don't always re-embed a fresh cumulative Score. The
+  // matches table's score is tracked incrementally as a running max across every event
+  // (see PipelineService.handleStreamEvent) and has proven correct end-to-end, so goals
+  // specifically should defer to it rather than a possibly-stale embedded snapshot.
+  if (authoritativeScore) {
+    home.goals = Math.max(home.goals, authoritativeScore.home);
+    away.goals = Math.max(away.goals, authoritativeScore.away);
   }
 
   for (const ev of events) {

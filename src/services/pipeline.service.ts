@@ -18,9 +18,6 @@ interface MatchAlertEvent {
   matchSlug: string;
 }
 
-// Team-scoped events (goal/card/corner/var) go to subscribers of that team who
-// opted into the event type; fulltime has no single team, so it goes to
-// subscribers of either side.
 async function pushMatchAlert(event: MatchAlertEvent): Promise<void> {
   try {
     const botUrl = process.env.BOT_INTERNAL_URL;
@@ -86,9 +83,144 @@ export class PipelineService {
   private txlineService: TxlineService;
   private isSyncing = false;
 
+  private streamedMatchCache = new Map<string, any>();
+  private streamedEventHashes = new Map<string, Set<string>>();
+
   constructor(solanaService: SolanaService, txlineService: TxlineService) {
     this.solanaService = solanaService;
     this.txlineService = txlineService;
+  }
+
+  /** Starts the persistent SSE consumer. Call once at process boot — it manages its own reconnects. */
+  public startLiveEventStream(): void {
+    this.refreshStreamedMatchCache();
+    setInterval(() => this.refreshStreamedMatchCache(), 20_000);
+
+    this.txlineService.streamScores((ev) => {
+      this.handleStreamEvent(ev).catch((err) => {
+        console.error("[TxLINE Stream] Error handling event:", err.message);
+      });
+    });
+  }
+
+  private async refreshStreamedMatchCache(): Promise<void> {
+    try {
+      const { data: activeMatches, error } = await supabaseAdmin
+        .from("matches")
+        .select("*")
+        .neq("id", "wc2026-winner")
+        .in("status", [MatchStatus.LIVE, MatchStatus.SCHEDULED, MatchStatus.HALFTIME]);
+      if (error || !activeMatches) return;
+
+      const seenFixtures = new Set(activeMatches.map((m) => m.txline_fixture_id));
+      for (const fixtureId of this.streamedMatchCache.keys()) {
+        if (!seenFixtures.has(fixtureId)) {
+          this.streamedMatchCache.delete(fixtureId);
+          this.streamedEventHashes.delete(fixtureId);
+        }
+      }
+
+      for (const match of activeMatches) {
+        this.streamedMatchCache.set(match.txline_fixture_id, match);
+        if (!this.streamedEventHashes.has(match.txline_fixture_id)) {
+          const { data: existingEvents } = await supabaseAdmin
+            .from("match_events")
+            .select("event_hash")
+            .eq("match_id", match.id);
+          this.streamedEventHashes.set(match.txline_fixture_id, new Set((existingEvents || []).map((e) => e.event_hash)));
+        }
+      }
+    } catch (err: any) {
+      console.error("[TxLINE Stream] Failed to refresh match cache:", err.message);
+    }
+  }
+
+  private async handleStreamEvent(ev: { eventType: string; occurredAt: string; payload: any }): Promise<void> {
+    const fixtureId = ev.payload?.FixtureId != null ? String(ev.payload.FixtureId) : null;
+    if (!fixtureId) return;
+
+    const match = this.streamedMatchCache.get(fixtureId);
+    if (!match) return; // Not one of ours — the stream covers every fixture TxLINE has, not just our tracked ones.
+
+    const eventHash = this.txlineService.computeEventHash(ev.payload);
+    const seenHashes = this.streamedEventHashes.get(fixtureId) || new Set<string>();
+    if (seenHashes.has(eventHash)) return;
+    seenHashes.add(eventHash);
+    this.streamedEventHashes.set(fixtureId, seenHashes);
+
+    const { data: nextNonce, error: rpcError } = await supabaseAdmin.rpc("next_event_nonce");
+    if (rpcError) {
+      console.error("[TxLINE Stream] Error fetching next nonce:", rpcError.message);
+      return;
+    }
+
+    const { error: insertError } = await supabaseAdmin.from("match_events").insert({
+      match_id: match.id,
+      event_nonce: nextNonce,
+      event_type: ev.eventType,
+      event_hash: eventHash,
+      payload: ev.payload,
+      occurred_at: new Date(ev.occurredAt || Date.now()).toISOString(),
+    });
+    if (insertError) {
+      console.error("[TxLINE Stream] Error inserting event:", insertError.message);
+      return;
+    }
+
+    let scoreHome = match.score_home ?? 0;
+    let scoreAway = match.score_away ?? 0;
+    let matchStatus = match.status;
+    let changed = false;
+
+    if (ev.payload?.Score) {
+      const p1IsHome = ev.payload.Participant1IsHome !== false;
+      const p1Goals = ev.payload.Score.Participant1?.Total?.Goals;
+      const p2Goals = ev.payload.Score.Participant2?.Total?.Goals;
+      const homeGoals = p1IsHome ? p1Goals : p2Goals;
+      const awayGoals = p1IsHome ? p2Goals : p1Goals;
+      if (homeGoals !== undefined && homeGoals > scoreHome) { scoreHome = homeGoals; changed = true; }
+      if (awayGoals !== undefined && awayGoals > scoreAway) { scoreAway = awayGoals; changed = true; }
+    }
+
+    const isFullTime = ev.eventType === "fulltime" || ev.eventType === "game_finalised";
+    if (isFullTime && matchStatus !== MatchStatus.FULL_TIME) {
+      matchStatus = MatchStatus.FULL_TIME;
+      changed = true;
+    }
+
+    if (changed) {
+      await supabaseAdmin
+        .from("matches")
+        .update({ status: matchStatus, score_home: scoreHome, score_away: scoreAway, updated_at: new Date().toISOString() })
+        .eq("id", match.id);
+      match.status = matchStatus;
+      match.score_home = scoreHome;
+      match.score_away = scoreAway;
+      this.streamedMatchCache.set(fixtureId, match);
+      console.log(`[TxLINE Stream] ${match.home_team} vs ${match.away_team}: ${scoreHome}-${scoreAway} (${matchStatus})`);
+    }
+
+    const isGoalEvent = ev.eventType === "goal" || ev.eventType === "score_update";
+    const isRedCard = ev.eventType === "red_card" || ev.eventType === "redcard";
+    const isYellowCard = ev.eventType === "card";
+    const isCornerEvent = ev.eventType === "corner";
+    const isVarEvent = ev.eventType === "var";
+    if (isGoalEvent || isRedCard || isYellowCard || isCornerEvent || isVarEvent) {
+      const eventTeam = ev.payload?.Participant === 2 ? match.away_team : match.home_team;
+      const elapsedNow = Math.max(1, Math.min(90, Math.floor((Date.now() - new Date(match.kickoff_at).getTime()) / 60000)));
+      pushMatchAlert({
+        type: isGoalEvent ? "goal" : isRedCard || isYellowCard ? "card" : isCornerEvent ? "corner" : "var",
+        team: eventTeam,
+        cardType: isRedCard ? "red" : isYellowCard ? "yellow" : undefined,
+        homeTeam: match.home_team,
+        awayTeam: match.away_team,
+        homeScore: scoreHome,
+        awayScore: scoreAway,
+        minute: elapsedNow,
+        competition: match.competition,
+        matchSlug: match.id,
+      }).catch(() => {});
+    }
   }
 
   public async tick(): Promise<{ eventsProcessed: number }> {
@@ -356,13 +488,17 @@ export class PipelineService {
 
           if (kickoffMs > nowMs) {
             matchStatus = MatchStatus.SCHEDULED;
+          } else if (elapsedMin >= 150) {
+            // Safety net independent of status: this used to only fire from SCHEDULED, so a
+            // match that had genuinely transitioned to LIVE but then never received a real
+            // fulltime/game_finalised signal (e.g. its feed just went quiet) stayed "live"
+            // indefinitely — one sat stuck for 7+ hours before this caught it.
+            matchStatus = MatchStatus.FULL_TIME;
           } else if (
             (matchStatus === MatchStatus.SCHEDULED || matchStatus === MatchStatus.HALFTIME) &&
-            elapsedMin >= 0 && elapsedMin < 120
+            elapsedMin >= 0
           ) {
             matchStatus = MatchStatus.LIVE;
-          } else if (matchStatus === MatchStatus.SCHEDULED && elapsedMin >= 120) {
-            matchStatus = MatchStatus.FULL_TIME;
           }
 
           const { data: existingEventsData } = await supabaseAdmin
@@ -372,7 +508,10 @@ export class PipelineService {
           const existingHashes = new Set((existingEventsData || []).map((e) => e.event_hash));
 
           for (const ev of events) {
-            const isFullTime = ev.eventType === "fulltime" || ev.eventType === "game_finalised" || ev.eventType === "disconnected";
+            // "disconnected" is the feed dropping, not the match ending — treating it as a
+            // fulltime signal is what marked a still-live 3-4 match as finished with a stale
+            // 0-3 score baked in.
+            const isFullTime = ev.eventType === "fulltime" || ev.eventType === "game_finalised";
             if (isFullTime && matchStatus !== MatchStatus.FULL_TIME) {
               matchStatus = MatchStatus.FULL_TIME;
             }
@@ -452,6 +591,20 @@ export class PipelineService {
                 }
               }
             }
+          }
+
+          // Cross-check against the snapshot endpoint, which returns full score history in
+          // one call (unlike the historical/streaming endpoint above, which can silently
+          // miss events after any downtime) — this is what keeps the recorded score correct
+          // even when the event log itself has gaps.
+          try {
+            const snapshot = await this.txlineService.getScoreSnapshot(match.txline_fixture_id);
+            if (snapshot) {
+              if (snapshot.home > scoreHome) scoreHome = snapshot.home;
+              if (snapshot.away > scoreAway) scoreAway = snapshot.away;
+            }
+          } catch (snapErr: any) {
+            console.error(`[Pipeline] Score snapshot check failed for ${match.txline_fixture_id}, continuing with event-derived score:`, snapErr.message);
           }
 
           if (matchStatus !== match.status || scoreHome !== (match.score_home ?? 0) || scoreAway !== (match.score_away ?? 0)) {

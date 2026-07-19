@@ -396,7 +396,7 @@ router.get("/:id/pulse", async (req, res) => {
     const minute = Math.max(1, Math.min(90, Math.floor(diffMs / 60000)));
     const isFinished = match.status === "full_time";
 
-    const stats = computeTeamStats(allEvents);
+    const stats = computeTeamStats(allEvents, { home: match.score_home ?? 0, away: match.score_away ?? 0 });
     const { points: momentum, current: momentumCurrent } = computeMomentum(allEvents, kickoffMs, isFinished ? 90 : minute);
     const timeline = computeTimeline(allEvents, kickoffMs);
     const winProbability = computeWinProbability(

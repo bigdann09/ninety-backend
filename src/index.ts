@@ -16,6 +16,20 @@ import pipelineRouter from "./routes/pipeline.router";
 
 dotenv.config();
 
+// This process has crashed twice from transient network blips (DNS/RPC/websocket errors
+// deep inside @solana/web3.js's connection layer, e.g. its internal RPC websocket emitting
+// an unhandled 'error' event) — Node kills the whole process on an unhandled rejection or
+// an EventEmitter 'error' with no listener by default. Every route already has its own
+// try/catch and the pipeline already logs+continues on its own errors, so a crash here
+// is always something escaping those — log it and keep the process (and the live feed,
+// and every other route) up instead of taking the whole backend down over one bad request.
+process.on("unhandledRejection", (reason) => {
+  console.error("[Process] Unhandled rejection (continuing):", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[Process] Uncaught exception (continuing):", err.message, err.stack);
+});
+
 const app = express();
 const port = process.env.PORT || 3001;
 const corsOrigin = process.env.FRONTEND_URL || "*";
@@ -80,16 +94,12 @@ app.use("/api/p2p/challenges", p2pRouter);
 app.use("/api/webhooks", webhooksRouter);
 app.use("/api/pipeline", pipelineRouter);
 app.use("/api/streak", streakRouter);
-app.use("/api", miscRouter); // stats, tournament, admin/db-status, notifications/telegram, proof, receipts — full paths defined inside
+app.use("/api", miscRouter);
 
 async function bootstrap() {
   try {
-    // Initializes the keeper Solana connection + TxODDS auth eagerly, so a broken
-    // integration fails loudly at boot rather than surfacing later as a silent 500.
-    await getPipelineService();
-
-    // Non-fatal: the tournament-winner markets are additive; a failure here must
-    // not keep live-match ingestion from starting.
+    const pipelineService = await getPipelineService();
+    pipelineService.startLiveEventStream();
     ensureTournamentMarkets(getSolanaService()).catch((e) =>
       console.error("[Tournament] Bootstrap failed:", e.message)
     );
